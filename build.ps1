@@ -3,7 +3,7 @@ param (
     $BuildPath = ".\build",
 
     [string[]]
-    $Architectures = @("amd64","386"),
+    $Architectures = @("amd64","386","arm64"),
 
     [switch]
     $Release = $false,
@@ -13,7 +13,6 @@ param (
 )
 
 # Cleanup
-Remove-item -LiteralPath .\assets.go -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $BuildPath -Force -Recurse -ErrorAction SilentlyContinue
 
 # Build output directory
@@ -26,10 +25,6 @@ $env:GOOS="windows"
 $env:GOARCH=$null
 
 $returnValue = 0
-
-# Generate assets.go
-go generate
-if ($LastExitCode -ne 0) { $returnValue = $LastExitCode }
 
 # Build for each architecture
 Foreach ($arch in $Architectures)
