@@ -18,6 +18,10 @@ $ export SSH_AUTH_SOCK=/mnt/c/wsl-ssh-pageant/ssh-agent.sock
 
 4. The SSH keys from Pageant should now be usable by `ssh`
 
+If the socket file was left behind by a previous run (after a crash, or Windows shutting down) it is replaced automatically. If the path is in use by another running instance, or is not a socket, `wsl-ssh-pageant` refuses to start unless you pass `--force`.
+
+Note: this works with WSL 1 only. WSL 2 runs in a virtual machine and cannot connect to a Windows `AF_UNIX` socket, see [#33](https://github.com/benpye/wsl-ssh-pageant/issues/33) for workarounds.
+
 ## How to use with Windows 10 native OpenSSH client
 
 1. On the Windows side start Pageant (or compatible agent such as gpg4win).
@@ -32,6 +36,8 @@ $ set SSH_AUTH_SOCK=\\.\pipe\ssh-pageant
 
 4. The SSH keys from Pageant should now be usable by the native Windows SSH client, try using `ssh` in `cmd.exe`
 
+Note: if your agent is a recent GnuPG you may not need this, `gpg-agent` can serve the native OpenSSH client directly with `enable-win32-openssh-support` in `gpg-agent.conf`, see [#58](https://github.com/benpye/wsl-ssh-pageant/issues/58).
+
 ## Systray Integration
 
 To add an icon to the systray run `wsl-ssh-pageant.exe --systray --winssh ssh-pageant` (or using `--wsl`).
@@ -40,23 +46,33 @@ To add an icon to the systray run `wsl-ssh-pageant.exe --systray --winssh ssh-pa
 
 You can use both `--winssh` and `--wsl` parameters at the same time with the same process to proxy for both
 
+## Troubleshooting
+
+Run with `--verbose` to log why a request failed. The most common causes are that Pageant is not running, or that it is running as a different user or as Administrator, in which case Windows will not deliver messages to it from a normal process.
+
 # Frequently asked questions
 
 ## How do I download it?
 Grab the latest release on the [releases page](https://github.com/benpye/wsl-ssh-pageant/releases).
 
 ## How do I build this?
-For WSL support you will need Go 1.12 or later,. Go 1.12 added support for `AF_UNIX` sockets on Windows.
+You will need the Go version named in `go.mod` or later (a recent Go will download it automatically).
 
-To create the assets.go run:
 ```
-go generate
+go build
 ```
 
 To create a build without a console window:
 ```
 go build -ldflags -H=windowsgui
 ```
+
+To run the tests (Windows only, they stand in a fake Pageant window so Pageant does not need to be running):
+```
+go test ./...
+```
+
+`build.ps1` builds both variants for every supported architecture.
 
 ## What version of Windows do I need?
 You need Windows 10 1803 or later for WSL support as it is the first version supporting `AF_UNIX` sockets. You can still use this with the native [Windows SSH client](https://github.com/PowerShell/Win32-OpenSSH/releases) on earlier builds.

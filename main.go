@@ -1,28 +1,29 @@
+//go:build windows
+
 package main
 
-//go:generate go run github.com/go-bindata/go-bindata/go-bindata -pkg $GOPACKAGE -o assets.go assets/
-
 import (
-	"bufio"
+	"context"
+	_ "embed"
 	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"os/user"
-	"reflect"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/Microsoft/go-winio"
 	"github.com/apenwarr/fixconsole"
 	"github.com/getlantern/systray"
-	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
 )
 
@@ -31,303 +32,398 @@ var (
 	namedPipe   = flag.String("winssh", "", "Named pipe for use with Win32 OpenSSH")
 	verbose     = flag.Bool("verbose", false, "Enable verbose logging")
 	systrayFlag = flag.Bool("systray", false, "Enable systray integration")
-	force       = flag.Bool("force", false, "Force socket usage (unlink existing socket)")
+	force       = flag.Bool("force", false, "Replace the Unix socket even if it is in use or is not a socket (stale sockets are always replaced)")
 )
 
-const (
-	// Windows constats
-	invalidHandleValue = ^windows.Handle(0)
-	pageReadWrite      = 0x4
-	fileMapWrite       = 0x2
+//go:embed assets/icon.ico
+var icon []byte
 
+const (
 	// ssh-agent/Pageant constants
 	agentMaxMessageLength = 8192
 	agentCopyDataID       = 0x804e50ba
+
+	// Requests larger than Pageant can handle are answered with a failure, but
+	// beyond this size the client is not speaking the agent protocol at all
+	// and is simply disconnected.
+	maxDiscardLength = 256 * 1024
+
+	// Size of sockaddr_un.sun_path
+	maxUnixSocketPath = 108
+
+	wmCopyData = 0x004A
+)
+
+var (
+	user32           = windows.NewLazySystemDLL("user32.dll")
+	procFindWindowW  = user32.NewProc("FindWindowW")
+	procSendMessageW = user32.NewProc("SendMessageW")
 )
 
 // copyDataStruct is used to pass data in the WM_COPYDATA message.
 // We directly pass a pointer to our copyDataStruct type, we need to be
-// careful that it matches the Windows type exactly
+// careful that it matches the Windows COPYDATASTRUCT type exactly
 type copyDataStruct struct {
 	dwData uintptr
 	cbData uint32
-	lpData uintptr
+	lpData *byte
 }
 
-type SecurityAttributes struct {
-	Length             uint32
-	SecurityDescriptor uintptr
-	InheritHandle      uint32
-}
+// failureMessage is the SSH_AGENT_FAILURE response
+var failureMessage = [...]byte{0, 0, 0, 1, 5}
 
 var queryPageantMutex sync.Mutex
 
+// pageantWindowName is both the class and the title of Pageant's hidden
+// window. It is a variable so tests can stand in a fake Pageant.
+var pageantWindowName = "Pageant"
+
+// queryFunc sends a single ssh-agent request (including the 4 byte length
+// prefix) to an agent and returns the response (also including the prefix).
+type queryFunc func(request []byte) ([]byte, error)
+
+// ptrFromAddr converts the address of memory that is not managed by Go into
+// a pointer. The indirection through &addr keeps go vet's unsafeptr check,
+// which guards against the GC moving Go objects, quiet.
+func ptrFromAddr[T any](addr uintptr) *T {
+	return *(**T)(unsafe.Pointer(&addr))
+}
+
+func debugf(format string, args ...any) {
+	if *verbose {
+		log.Printf(format, args...)
+	}
+}
+
+// makeInheritSaWithSid returns security attributes for the shared file
+// mapping that are owned by the current user, Pageant refuses to use a
+// mapping that is not owned by the user it is running as.
 func makeInheritSaWithSid() *windows.SecurityAttributes {
-	var sa windows.SecurityAttributes
+	sa := &windows.SecurityAttributes{InheritHandle: 1}
+	sa.Length = uint32(unsafe.Sizeof(*sa))
 
-	u, err := user.Current()
-
-	if err == nil {
-		sd, err := windows.SecurityDescriptorFromString("O:" + u.Uid)
-		if err == nil {
+	if u, err := user.Current(); err == nil {
+		if sd, err := windows.SecurityDescriptorFromString("O:" + u.Uid); err == nil {
 			sa.SecurityDescriptor = sd
 		}
 	}
 
-	sa.Length = uint32(unsafe.Sizeof(sa))
-
-	sa.InheritHandle = 1
-
-	return &sa
-
+	return sa
 }
 
-func queryPageant(buf []byte) (result []byte, err error) {
-	if len(buf) > agentMaxMessageLength {
-		err = errors.New("Message too long")
-		return
+func findPageantWindow() (windows.HWND, error) {
+	name, err := windows.UTF16PtrFromString(pageantWindowName)
+	if err != nil {
+		return 0, err
 	}
 
-	hwnd := win.FindWindow(syscall.StringToUTF16Ptr("Pageant"), syscall.StringToUTF16Ptr("Pageant"))
-
+	hwnd, _, _ := procFindWindowW.Call(uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(name)))
 	if hwnd == 0 {
-		err = errors.New("Could not find Pageant window")
-		return
+		return 0, errors.New("could not find Pageant window")
 	}
 
-	// Typically you'd add thread ID here but thread ID isn't useful in Go
-	// We would need goroutine ID but Go hides this and provides no good way of
-	// accessing it, instead we serialise calls to queryPageant and treat it
-	// as not being goroutine safe
-	mapName := fmt.Sprintf("WSLPageantRequest")
+	return windows.HWND(hwnd), nil
+}
+
+// pageantAccessHint explains the most common reason for Pageant rejecting a
+// message: it is running as another user, or elevated when we are not, in
+// which case Windows does not deliver WM_COPYDATA to it.
+func pageantAccessHint(hwnd windows.HWND) string {
+	const cannotInspect = "; Pageant may be running as a different user or as Administrator"
+
+	var pid uint32
+	if _, err := windows.GetWindowThreadProcessId(hwnd, &pid); err != nil || pid == 0 {
+		return ""
+	}
+
+	process, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return cannotInspect
+	}
+	defer windows.CloseHandle(process)
+
+	var token windows.Token
+	if err := windows.OpenProcessToken(process, windows.TOKEN_QUERY, &token); err != nil {
+		return cannotInspect
+	}
+	defer token.Close()
+
+	self := windows.GetCurrentProcessToken()
+	pageantUser, err := token.GetTokenUser()
+	if err != nil {
+		return cannotInspect
+	}
+	selfUser, err := self.GetTokenUser()
+	if err != nil {
+		return ""
+	}
+
+	if !pageantUser.User.Sid.Equals(selfUser.User.Sid) {
+		return fmt.Sprintf("; Pageant (pid %d) is running as a different user (%s)", pid, pageantUser.User.Sid)
+	}
+	if token.IsElevated() && !self.IsElevated() {
+		return fmt.Sprintf("; Pageant (pid %d) is running as Administrator but wsl-ssh-pageant is not", pid)
+	}
+
+	return ""
+}
+
+// queryPageant is the queryFunc for Pageant (or a compatible agent such as
+// gpg-agent with enable-putty-support).
+func queryPageant(buf []byte) ([]byte, error) {
+	if len(buf) > agentMaxMessageLength {
+		return nil, errors.New("message too long")
+	}
+
+	hwnd, err := findPageantWindow()
+	if err != nil {
+		return nil, err
+	}
+
+	// Pageant clients typically make the mapping name unique with their thread
+	// ID, but a goroutine has no stable thread. Instead we use the process ID
+	// and serialise calls to queryPageant.
 	queryPageantMutex.Lock()
+	defer queryPageantMutex.Unlock()
 
-	var sa = makeInheritSaWithSid()
-
-	fileMap, err := windows.CreateFileMapping(invalidHandleValue, sa, pageReadWrite, 0, agentMaxMessageLength, syscall.StringToUTF16Ptr(mapName))
+	mapName := fmt.Sprintf("WSLPageantRequest%08x", windows.GetCurrentProcessId())
+	mapNamePtr, err := windows.UTF16PtrFromString(mapName)
 	if err != nil {
-		queryPageantMutex.Unlock()
-		return
+		return nil, err
 	}
-	defer func() {
-		windows.CloseHandle(fileMap)
-		queryPageantMutex.Unlock()
-	}()
 
-	sharedMemory, err := windows.MapViewOfFile(fileMap, fileMapWrite, 0, 0, 0)
+	fileMap, err := windows.CreateFileMapping(windows.InvalidHandle, makeInheritSaWithSid(), windows.PAGE_READWRITE, 0, agentMaxMessageLength, mapNamePtr)
 	if err != nil {
-		return
+		return nil, fmt.Errorf("CreateFileMapping: %w", err)
 	}
-	defer windows.UnmapViewOfFile(sharedMemory)
+	defer windows.CloseHandle(fileMap)
 
-	sharedMemoryArray := (*[agentMaxMessageLength]byte)(unsafe.Pointer(sharedMemory))
-	copy(sharedMemoryArray[:], buf)
+	addr, err := windows.MapViewOfFile(fileMap, windows.FILE_MAP_WRITE, 0, 0, 0)
+	if err != nil {
+		return nil, fmt.Errorf("MapViewOfFile: %w", err)
+	}
+	defer windows.UnmapViewOfFile(addr)
 
-	mapNameWithNul := mapName + "\000"
+	sharedMemory := unsafe.Slice(ptrFromAddr[byte](addr), agentMaxMessageLength)
+	copy(sharedMemory, buf)
 
-	// We use our knowledge of Go strings to get the length and pointer to the
-	// data and the length directly
+	// Pageant expects the NUL terminated ANSI name of the file mapping
+	mapNameZ := append([]byte(mapName), 0)
 	cds := copyDataStruct{
 		dwData: agentCopyDataID,
-		cbData: uint32(((*reflect.StringHeader)(unsafe.Pointer(&mapNameWithNul))).Len),
-		lpData: ((*reflect.StringHeader)(unsafe.Pointer(&mapNameWithNul))).Data,
+		cbData: uint32(len(mapNameZ)),
+		lpData: &mapNameZ[0],
 	}
 
-	ret := win.SendMessage(hwnd, win.WM_COPYDATA, 0, uintptr(unsafe.Pointer(&cds)))
+	ret, _, _ := procSendMessageW.Call(uintptr(hwnd), wmCopyData, 0, uintptr(unsafe.Pointer(&cds)))
 	if ret == 0 {
-		err = errors.New("WM_COPYDATA failed")
-		return
+		return nil, errors.New("WM_COPYDATA failed" + pageantAccessHint(hwnd))
 	}
 
-	len := binary.BigEndian.Uint32(sharedMemoryArray[:4])
-	len += 4
-
-	if len > agentMaxMessageLength {
-		err = errors.New("Return message too long")
-		return
+	respLen := binary.BigEndian.Uint32(sharedMemory[:4])
+	if respLen > agentMaxMessageLength-4 {
+		return nil, errors.New("return message too long")
 	}
 
-	result = make([]byte, len)
-	copy(result, sharedMemoryArray[:len])
-
-	return
+	return append([]byte(nil), sharedMemory[:respLen+4]...), nil
 }
 
-var failureMessage = [...]byte{0, 0, 0, 1, 5}
-
-func handleConnection(conn net.Conn) {
+func handleConnection(conn net.Conn, query queryFunc) {
 	defer conn.Close()
 
-	reader := bufio.NewReader(conn)
-
 	for {
-		lenBuf := make([]byte, 4)
-		_, err := io.ReadFull(reader, lenBuf)
-		if err != nil {
-			if *verbose {
-				log.Printf("io.ReadFull error '%s'", err)
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+			if !errors.Is(err, io.EOF) {
+				debugf("Read error '%s'", err)
 			}
 			return
 		}
 
-		len := binary.BigEndian.Uint32(lenBuf)
-		buf := make([]byte, len)
-		_, err = io.ReadFull(reader, buf)
-		if err != nil {
-			if *verbose {
-				log.Printf("io.ReadFull error '%s'", err)
+		// Pageant can't handle anything larger than the shared mapping, so
+		// don't let a client make us buffer more than that.
+		msgLen := binary.BigEndian.Uint32(lenBuf[:])
+		var result []byte
+		if msgLen > agentMaxMessageLength-4 {
+			debugf("Request too long (%d bytes)", msgLen)
+			if msgLen > maxDiscardLength {
+				return
 			}
-			return
-		}
-
-		result, err := queryPageant(append(lenBuf, buf...))
-		if err != nil {
-			// If for some reason talking to Pageant fails we fall back to
-			// sending an agent error to the client
-			if *verbose {
-				log.Printf("Pageant query error '%s'", err)
+			if _, err := io.CopyN(io.Discard, conn, int64(msgLen)); err != nil {
+				debugf("Read error '%s'", err)
+				return
 			}
 			result = failureMessage[:]
+		} else {
+			buf := make([]byte, 4+msgLen)
+			copy(buf, lenBuf[:])
+			if _, err := io.ReadFull(conn, buf[4:]); err != nil {
+				debugf("Read error '%s'", err)
+				return
+			}
+
+			var err error
+			result, err = query(buf)
+			if err != nil {
+				// If for some reason talking to Pageant fails we fall back to
+				// sending an agent error to the client
+				debugf("Pageant query error '%s'", err)
+				result = failureMessage[:]
+			}
 		}
 
-		_, err = conn.Write(result)
-		if err != nil {
-			if *verbose {
-				log.Printf("net.Conn.Write error '%s'", err)
-			}
+		if _, err := conn.Write(result); err != nil {
+			debugf("Write error '%s'", err)
 			return
 		}
 	}
 }
 
-func listenLoop(ln net.Listener) {
-	defer ln.Close()
-
+// listenLoop accepts connections until the listener fails or is closed.
+func listenLoop(ctx context.Context, ln net.Listener, query queryFunc) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("net.Listener.Accept error '%s'", err)
+			// An error after cancellation is just the listener being closed
+			if ctx.Err() == nil {
+				log.Printf("Accept error '%s'", err)
+			}
 			return
 		}
 
-		if *verbose {
-			log.Printf("New connection: %v\n", conn)
+		debugf("New connection on %s", ln.Addr())
+
+		go handleConnection(conn, query)
+	}
+}
+
+// removeExistingSocket clears the way for a new listener at path. A socket
+// that nothing is listening on any more (left behind by a crash, or by
+// Windows shutting down) is removed, a live one is only removed when force
+// is set, as is anything that is not a socket at all.
+func removeExistingSocket(path string, force bool) error {
+	fi, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+
+	if !force {
+		if err != nil {
+			return fmt.Errorf("could not inspect %s: %w, delete it manually or use the --force option", path, err)
+		}
+		if fi.Mode()&fs.ModeSocket == 0 {
+			return fmt.Errorf("%s already exists and is not a socket, delete it manually or use the --force option", path)
 		}
 
-		go handleConnection(conn)
+		if conn, err := net.DialTimeout("unix", path, time.Second); err == nil {
+			conn.Close()
+			return fmt.Errorf("socket %s is already in use, is another wsl-ssh-pageant running? Use the --force option to replace it", path)
+		}
+		debugf("Removing stale socket %s", path)
 	}
+
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("failed to unlink socket %s: %w", path, err)
+	}
+
+	return nil
+}
+
+func listenUnix(path string, force bool) (net.Listener, error) {
+	// sockaddr_un has room for 108 bytes including the terminating NUL, past
+	// that bind fails with an unhelpful "invalid argument"
+	if len(path) >= maxUnixSocketPath {
+		return nil, fmt.Errorf("socket path %s is too long (%d characters, the limit is %d)", path, len(path), maxUnixSocketPath-1)
+	}
+
+	if err := removeExistingSocket(path, force); err != nil {
+		return nil, err
+	}
+
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("could not open socket %s: %w", path, err)
+	}
+
+	return ln, nil
+}
+
+func run() error {
+	// Cancelled on Ctrl+C, or when a listener breaks
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	serve := func(ln net.Listener) {
+		go func() {
+			listenLoop(ctx, ln, queryPageant)
+
+			// If for some reason our listener breaks, kill the program
+			cancel()
+		}()
+	}
+
+	if *unixSocket != "" {
+		ln, err := listenUnix(*unixSocket, *force)
+		if err != nil {
+			return err
+		}
+		defer ln.Close()
+
+		log.Printf("Listening on Unix socket: %s", *unixSocket)
+		serve(ln)
+	}
+
+	if *namedPipe != "" {
+		name := `\\.\pipe\` + *namedPipe
+		ln, err := winio.ListenPipe(name, nil)
+		if err != nil {
+			return fmt.Errorf("could not open named pipe %s: %w", name, err)
+		}
+		defer ln.Close()
+
+		log.Printf("Listening on named pipe: %s", name)
+		serve(ln)
+	}
+
+	if *systrayFlag {
+		go func() {
+			<-ctx.Done()
+			systray.Quit()
+		}()
+
+		// Blocks until systray.Quit is called
+		systray.Run(onSystrayReady, nil)
+	} else {
+		<-ctx.Done()
+	}
+
+	log.Print("Exiting...")
+	return nil
 }
 
 func main() {
 	fixconsole.FixConsoleIfNeeded()
 	flag.Parse()
 
-	var unix, pipe net.Listener
-	var err error
-
-	done := make(chan bool, 1)
-
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		sig := <-sigs
-		switch sig {
-		case os.Interrupt:
-			log.Printf("Caught signal")
-			done <- true
-		}
-	}()
-
-	if *unixSocket != "" {
-		_, err := os.Stat(*unixSocket)
-		if err == nil || !os.IsNotExist(err) {
-			if *force {
-				// If the socket file already exists then unlink it
-				err = syscall.Unlink(*unixSocket)
-				if err != nil {
-					log.Fatalf("Failed to unlink socket %s, error '%s'\n", *unixSocket, err)
-				}
-			} else {
-				log.Fatalf("Error: the SSH_AUTH_SOCK file already exists. Please delete it manually or use --force option.")
-			}
-		}
-
-		unix, err = net.Listen("unix", *unixSocket)
-		if err != nil {
-			log.Fatalf("Could not open socket %s, error '%s'\n", *unixSocket, err)
-		}
-
-		defer unix.Close()
-		log.Printf("Listening on Unix socket: %s\n", *unixSocket)
-		go func() {
-			listenLoop(unix)
-
-			// If for some reason our listener breaks, kill the program
-			done <- true
-		}()
-	}
-
-	if *namedPipe != "" {
-		namedPipeFullName := "\\\\.\\pipe\\" + *namedPipe
-		var cfg = &winio.PipeConfig{}
-		pipe, err = winio.ListenPipe(namedPipeFullName, cfg)
-		if err != nil {
-			log.Fatalf("Could not open named pipe %s, error '%s'\n", namedPipeFullName, err)
-		}
-
-		defer pipe.Close()
-		log.Printf("Listening on named pipe: %s\n", namedPipeFullName)
-		go func() {
-			listenLoop(pipe)
-
-			// If for some reason our listener breaks, kill the program
-			done <- true
-		}()
-	}
-
 	if *namedPipe == "" && *unixSocket == "" {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
-	if *systrayFlag {
-		go func() {
-			// Wait until we are signalled as finished
-			<-done
-
-			// If for some reason our listener breaks, kill the program
-			systray.Quit()
-		}()
-
-		systray.Run(onSystrayReady, nil)
-
-		log.Print("Exiting...")
-	} else {
-		// Wait until we are signalled as finished
-		<-done
-
-		log.Print("Exiting...")
+	if err := run(); err != nil {
+		log.Fatalf("Error: %s", err)
 	}
 }
 
 func onSystrayReady() {
 	systray.SetTitle("WSL-SSH-Pageant")
 	systray.SetTooltip("WSL-SSH-Pageant")
-
-	data, err := Asset("assets/icon.ico")
-	if err == nil {
-		systray.SetIcon(data)
-	}
+	systray.SetIcon(icon)
 
 	quit := systray.AddMenuItem("Quit", "Quits this app")
 
 	go func() {
-		for {
-			select {
-			case <-quit.ClickedCh:
-				systray.Quit()
-				return
-			}
-		}
+		<-quit.ClickedCh
+		systray.Quit()
 	}()
 }

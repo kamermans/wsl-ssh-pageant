@@ -1,21 +1,31 @@
 module github.com/benpye/wsl-ssh-pageant
 
-go 1.12
+go 1.26.0
 
 require (
-	github.com/Microsoft/go-winio v0.4.11
-	github.com/apenwarr/fixconsole v0.0.0-20190407065125-35b2e7d921eb
-	github.com/getlantern/context v0.0.0-20190109183933-c447772a6520 // indirect
-	github.com/getlantern/errors v0.0.0-20190325191628-abdb3e3e36f7 // indirect
-	github.com/getlantern/golog v0.0.0-20170508214112-cca714f7feb5 // indirect
-	github.com/getlantern/hex v0.0.0-20190417191902-c6586a6fe0b7 // indirect
-	github.com/getlantern/hidden v0.0.0-20190325191715-f02dbb02be55 // indirect
-	github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f // indirect
-	github.com/getlantern/systray v0.0.0-20190131073753-26d5b920200d
-	github.com/go-bindata/go-bindata v3.1.1+incompatible // indirect
-	github.com/go-stack/stack v1.8.0 // indirect
-	github.com/lxn/win v0.0.0-20181015143721-a7f87360b10e
-	github.com/oxtoacart/bpool v0.0.0-20190227141107-8c4636f812cc // indirect
-	github.com/stretchr/testify v1.3.0 // indirect
-	golang.org/x/sys v0.0.0-20200317113312-5766fd39f98d
+	github.com/Microsoft/go-winio v0.6.4
+	github.com/apenwarr/fixconsole v0.0.0-20191012055117-5a9f6489cc29
+	github.com/getlantern/systray v1.2.2
+	golang.org/x/sys v0.50.0
+)
+
+require (
+	github.com/apenwarr/w32 v0.0.0-20190407065021-aa00fece76ab // indirect
+	github.com/getlantern/context v0.0.0-20220418194847-3d5e7a086201 // indirect
+	github.com/getlantern/errors v1.0.4 // indirect
+	github.com/getlantern/golog v0.0.0-20230503153817-8e72de7e0a65 // indirect
+	github.com/getlantern/hex v0.0.0-20220104173244-ad7e4b9194dc // indirect
+	github.com/getlantern/hidden v0.0.0-20220104173330-f221c5a24770 // indirect
+	github.com/getlantern/ops v0.0.0-20261028165752-a48eabe17467 // indirect
+	github.com/go-logr/logr v1.2.4 // indirect
+	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/go-stack/stack v1.8.1 // indirect
+	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
+	github.com/stretchr/testify v1.12.1 // indirect
+	go.opentelemetry.io/otel v1.19.0 // indirect
+	go.opentelemetry.io/otel/metric v1.19.0 // indirect
+	go.opentelemetry.io/otel/trace v1.19.0 // indirect
+	go.uber.org/atomic v1.7.0 // indirect
+	go.uber.org/multierr v1.6.0 // indirect
+	go.uber.org/zap v1.19.1 // indirect
 )
